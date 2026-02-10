@@ -191,7 +191,7 @@ function CFSocket:Start()
 	-- init keys
 	for _, inst in ipairs(self.Folder:GetChildren()) do
 		if inst:IsA("Player") then
-			self._last[inst] = posKey(inst.CFrame)
+			self._last[inst] = posKey(gethiddenproperty(inst,"CloudEditCameraCoordinateFrame"))
 		end
 	end
 

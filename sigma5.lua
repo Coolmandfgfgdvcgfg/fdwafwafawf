@@ -19,11 +19,11 @@ CFSocket.__index = CFSocket
 
 -- ========= Clean property helpers =========
 local function getproperty(inst, prop)
-	return inst[prop]
+	return gethiddenproperty(inst, prop)
 end
 
 local function setproperty(inst, prop, val)
-	inst[prop] = val
+	sethiddenproperty(inst, prop, val)
 end
 
 -- ========= Packet format (9 bytes in Position => 72 bits => 3x24-bit ints) =========

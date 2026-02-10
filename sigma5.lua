@@ -3,23 +3,28 @@
 -- Folder = game.Players
 -- Local endpoint = game.Players.LocalPlayer
 --
--- Uses gethiddenproperty/sethiddenproperty for reads/writes (clean).
--- Supports ALL characters (raw bytes), chunking, reassembly, and optional ACK confirms.
---
--- Receive callback signature:
---   callback(fromPlayer, messageString)
---
--- Usage (client):
---   local sock = CFSocket.new(game.Players, "CloudEditCameraCoordinateFrame", 0)
---   sock:OnMessage(function(fromPlr, msg) print("FROM", fromPlr.Name, msg) end)
---   sock:Start()
---   sock:Send("hello 👋", { reliable=true, requireAcks=1, ackTimeout=0.4, resendInterval=0.1 })
+-- ✅ Uses getproperty/setproperty for reads/writes
+-- ✅ Supports ALL characters (raw bytes)
+-- ✅ Chunking + reassembly
+-- ✅ Optional ACK confirm packets (best-effort)
+-- ✅ PollRate = 0 => poll every Heartbeat
+-- ✅ OUTGOING QUEUE so Send() calls never overlap (prevents spam overwrite)
+-- ✅ Loopback so you receive your own sends instantly (no polling needed)
 
 local RunService = game:GetService("RunService")
 local Players = game:GetService("Players")
 
 local CFSocket = {}
 CFSocket.__index = CFSocket
+
+-- ========= Clean property helpers =========
+local function getproperty(inst, prop)
+	return inst[prop]
+end
+
+local function setproperty(inst, prop, val)
+	inst[prop] = val
+end
 
 -- ========= Packet format (9 bytes in Position => 72 bits => 3x24-bit ints) =========
 -- DATA packet:
@@ -85,7 +90,7 @@ local function cfToABC(cf)
 end
 
 local function abcToCFrame(a,b,c)
-	return CFrame.new(a, b, c) -- identity rotation
+	return CFrame.new(a, b, c) -- identity rotation only
 end
 
 local function keyFromABC(a,b,c)
@@ -134,6 +139,8 @@ local function fireCallbacks(callbacks, fromPlayer, message)
 end
 
 -- ========= constructor =========
+-- folder must be game.Players
+-- propName is the property to tunnel through (ex: "CloudEditCameraCoordinateFrame")
 function CFSocket.new(folder: Instance, propName: string, pollRate: number?)
 	assert(folder == Players, "CFSocket.new: folder must be game.Players")
 	assert(type(propName) == "string" and #propName > 0, "CFSocket.new: propName must be a string")
@@ -141,7 +148,6 @@ function CFSocket.new(folder: Instance, propName: string, pollRate: number?)
 	return setmetatable({
 		Folder = folder,
 		Prop = propName,
-
 		LocalPlayer = Players.LocalPlayer,
 
 		PollRate = pollRate or 0, -- 0 = every Heartbeat
@@ -152,13 +158,23 @@ function CFSocket.new(folder: Instance, propName: string, pollRate: number?)
 		-- _rx[fromPlayer][msgId] = { total, got, chunks, last }
 		_rx = {},
 
-		-- _acks[msgId] = { gotFrom = { [peerHash16]=true }, firstTime }
+		-- _acks[msgId] = { gotFrom = { [peerHash16]=true } }
 		_acks = {},
 
 		_nextId = 0,
 
 		_conn = nil,
 		_accum = 0,
+
+		-- outgoing queue (prevents overlap/spam overwrite)
+		_outQueue = {},
+		_outWorkerRunning = false,
+
+		-- pacing: send 1 chunk per Heartbeat (default true)
+		ChunkPerHeartbeat = true,
+
+		-- loopback self receives
+		Loopback = true,
 	}, CFSocket)
 end
 
@@ -167,9 +183,28 @@ function CFSocket:OnMessage(callback)
 	table.insert(self._callbacks, callback)
 end
 
--- ========= packet handlers =========
+-- ========= internal: send one packet write =========
+function CFSocket:_writePacket(bytes9)
+	local a,b,c = bytesToABC(bytes9)
+	setproperty(self.LocalPlayer, self.Prop, abcToCFrame(a,b,c))
+end
+
+function CFSocket:_makeDataPacket(msgId, chunkIndex, totalChunks, payloadBytes, payloadLen)
+	local bytes9 = {
+		KIND_DATA,
+		msgId,
+		chunkIndex,
+		totalChunks,
+		payloadLen,
+		0,0,0,0
+	}
+	for i = 1, payloadLen do
+		bytes9[5 + i] = payloadBytes[i]
+	end
+	return bytes9
+end
+
 function CFSocket:_sendAck(msgId: number, originalSender: Player)
-	-- ACK is broadcast by writing to OUR LocalPlayer property.
 	local senderHash = hash16(originalSender.Name)
 	local meHash = hash16(self.LocalPlayer.Name)
 
@@ -180,11 +215,14 @@ function CFSocket:_sendAck(msgId: number, originalSender: Player)
 		hi8(meHash), lo8(meHash),
 		0, 0, 0
 	}
-
-	local a,b,c = bytesToABC(bytes9)
-	sethiddenproperty(self.LocalPlayer, self.Prop, abcToCFrame(a,b,c))
+	self:_writePacket(bytes9)
 end
 
+function CFSocket:_loopback(message: string)
+	fireCallbacks(self._callbacks, self.LocalPlayer, message)
+end
+
+-- ========= RX handlers =========
 function CFSocket:_handleAck(fromPlayer: Player, bytes9)
 	local msgId = bytes9[2]
 	local senderHash = (bytes9[3] * 256) + bytes9[4]
@@ -192,7 +230,7 @@ function CFSocket:_handleAck(fromPlayer: Player, bytes9)
 
 	local myHash = hash16(self.LocalPlayer.Name)
 	if senderHash ~= myHash then
-		return -- not for us
+		return
 	end
 
 	local st = self._acks[msgId]
@@ -230,7 +268,7 @@ function CFSocket:_handleData(fromPlayer: Player, bytes9)
 		bySender[msgId] = st
 	end
 
-	-- reset if total changed (new msg reused id etc.)
+	-- reset if total changed (new msg reused id, etc.)
 	if st.total ~= total then
 		st.total = total
 		st.got = 0
@@ -247,9 +285,7 @@ function CFSocket:_handleData(fromPlayer: Player, bytes9)
 		local allBytes = {}
 		for i = 1, st.total do
 			local ch = st.chunks[i]
-			if not ch then
-				return
-			end
+			if not ch then return end
 			for j = 1, #ch do
 				table.insert(allBytes, ch[j])
 			end
@@ -260,7 +296,7 @@ function CFSocket:_handleData(fromPlayer: Player, bytes9)
 		local msg = byteArrayToString(allBytes)
 		fireCallbacks(self._callbacks, fromPlayer, msg)
 
-		-- confirm receipt back to sender (best-effort)
+		-- confirm receipt (best-effort)
 		self:_sendAck(msgId, fromPlayer)
 	end
 end
@@ -282,8 +318,9 @@ function CFSocket:_poll()
 	end
 
 	for _, plr in ipairs(self.Folder:GetPlayers()) do
+		-- we intentionally skip self because loopback handles self cleanly
 		if plr ~= self.LocalPlayer then
-			local cf = gethiddenproperty(plr, self.Prop)
+			local cf = getproperty(plr, self.Prop)
 			if typeof(cf) == "CFrame" then
 				local a,b,c = cfToABC(cf)
 				local key = keyFromABC(a,b,c)
@@ -317,7 +354,7 @@ function CFSocket:Start()
 
 	-- init last keys so we don't trigger old data
 	for _, plr in ipairs(self.Folder:GetPlayers()) do
-		local cf = gethiddenproperty(plr, self.Prop)
+		local cf = getproperty(plr, self.Prop)
 		if typeof(cf) == "CFrame" then
 			local a,b,c = cfToABC(cf)
 			self._lastKey[plr] = keyFromABC(a,b,c)
@@ -342,121 +379,137 @@ function CFSocket:Stop()
 		self._conn:Disconnect()
 		self._conn = nil
 	end
+	-- stop worker and clear queue
+	self._outQueue = {}
+	self._outWorkerRunning = false
 end
 
--- ========= send =========
-function CFSocket:_makeDataPacket(msgId, chunkIndex, totalChunks, payloadBytes, payloadLen)
-	local bytes9 = {
-		KIND_DATA,
-		msgId,
-		chunkIndex,
-		totalChunks,
-		payloadLen,
-		0,0,0,0
-	}
-	for i = 1, payloadLen do
-		bytes9[5 + i] = payloadBytes[i]
-	end
-	return bytes9
-end
-
-function CFSocket:_writePacket(bytes9)
-	local a,b,c = bytesToABC(bytes9)
-	sethiddenproperty(self.LocalPlayer, self.Prop, abcToCFrame(a,b,c))
-end
-
--- Send string (all chars)
--- options:
---   reliable (boolean)      resend until enough acks or timeout
---   requireAcks (number)   how many unique peers must ack (default 1 if reliable)
---   ackTimeout (number)
---   resendInterval (number)
+-- ========= QUEUED SENDING =========
+-- Enqueue a send request so nothing overlaps.
+-- Returns the msgId that will be used for the message (reserved immediately).
 function CFSocket:Send(message: any, options: table?)
+	assert(typeof(message) == "string", "CFSocket:Send supports string (all characters)")
 	options = options or {}
-	assert(typeof(message) == "string", "CFSocket:Send only supports string (all characters)")
 
-	local reliable = options.reliable == true
-	local ackTimeout = options.ackTimeout or 0.35
-	local resendInterval = options.resendInterval or 0.10
-	local requireAcks = options.requireAcks or (reliable and 1 or 0)
-
-	local bytes = stringToByteArray(message)
-	local totalChunks = math.max(1, math.ceil(#bytes / CHUNK_PAYLOAD))
-
+	-- reserve msgId NOW so caller can see it immediately
 	self._nextId = (self._nextId + 1) % 256
 	local msgId = self._nextId
 
-	-- build packets
-	local packets = table.create(totalChunks)
-	local idx = 1
-	for chunkIndex = 1, totalChunks do
-		local payload = {}
-		local payLen = 0
-		for j = 1, CHUNK_PAYLOAD do
-			if idx <= #bytes then
-				payLen += 1
-				payload[payLen] = bytes[idx]
-				idx += 1
-			else
-				break
+	table.insert(self._outQueue, {
+		msgId = msgId,
+		message = message,
+		options = options,
+	})
+
+	-- start worker if not running
+	if not self._outWorkerRunning then
+		self._outWorkerRunning = true
+		task.spawn(function()
+			self:_outWorker()
+		end)
+	end
+
+	return msgId
+end
+
+function CFSocket:_outWorker()
+	while self._outWorkerRunning do
+		local item = table.remove(self._outQueue, 1)
+		if not item then
+			self._outWorkerRunning = false
+			break
+		end
+
+		local msgId = item.msgId
+		local message = item.message
+		local options = item.options or {}
+
+		local reliable = options.reliable == true
+		local ackTimeout = options.ackTimeout or 0.35
+		local resendInterval = options.resendInterval or 0.10
+		local requireAcks = options.requireAcks or (reliable and 1 or 0)
+
+		local bytes = stringToByteArray(message)
+		local totalChunks = math.max(1, math.ceil(#bytes / CHUNK_PAYLOAD))
+
+		-- build packets
+		local packets = table.create(totalChunks)
+		local idx = 1
+		for chunkIndex = 1, totalChunks do
+			local payload = {}
+			local payLen = 0
+			for j = 1, CHUNK_PAYLOAD do
+				if idx <= #bytes then
+					payLen += 1
+					payload[payLen] = bytes[idx]
+					idx += 1
+				else
+					break
+				end
 			end
-		end
-		packets[chunkIndex] = self:_makeDataPacket(msgId, chunkIndex, totalChunks, payload, payLen)
-	end
-
-	-- blast once if not reliable
-	if not reliable then
-		for i = 1, totalChunks do
-			self:_writePacket(packets[i])
-		end
-		return msgId
-	end
-
-	-- reliable tracking
-	self._acks[msgId] = {
-		gotFrom = {},
-		firstTime = os.clock(),
-	}
-
-	-- initial send
-	for i = 1, totalChunks do
-		self:_writePacket(packets[i])
-	end
-
-	local start = os.clock()
-	local lastResend = start
-
-	-- blocking wait (wrap in task.spawn if you want non-blocking)
-	while true do
-		RunService.Heartbeat:Wait()
-
-		local st = self._acks[msgId]
-		if not st then
-			return msgId
+			packets[chunkIndex] = self:_makeDataPacket(msgId, chunkIndex, totalChunks, payload, payLen)
 		end
 
-		local count = 0
-		for _ in pairs(st.gotFrom) do
-			count += 1
+		-- loopback immediately (so you receive your own message)
+		if self.Loopback then
+			self:_loopback(message)
 		end
 
-		if count >= requireAcks then
-			self._acks[msgId] = nil
-			return msgId
-		end
-
-		local now = os.clock()
-		if now - start >= ackTimeout then
-			self._acks[msgId] = nil
-			return msgId
-		end
-
-		if now - lastResend >= resendInterval then
-			lastResend = now
+		local function sendAllOnce()
 			for i = 1, totalChunks do
 				self:_writePacket(packets[i])
+
+				-- pacing: 1 chunk per Heartbeat so receivers polling every Heartbeat won't miss
+				if self.ChunkPerHeartbeat then
+					RunService.Heartbeat:Wait()
+				end
 			end
 		end
+
+		if not reliable then
+			sendAllOnce()
+		else
+			self._acks[msgId] = { gotFrom = {}, firstTime = os.clock() }
+
+			-- initial send
+			sendAllOnce()
+
+			local start = os.clock()
+			local lastResend = start
+
+			while true do
+				RunService.Heartbeat:Wait()
+
+				local st = self._acks[msgId]
+				if not st then
+					break
+				end
+
+				local count = 0
+				for _ in pairs(st.gotFrom) do
+					count += 1
+				end
+
+				if count >= requireAcks then
+					self._acks[msgId] = nil
+					break
+				end
+
+				local now = os.clock()
+				if now - start >= ackTimeout then
+					self._acks[msgId] = nil
+					break
+				end
+
+				if now - lastResend >= resendInterval then
+					lastResend = now
+					sendAllOnce()
+				end
+			end
+		end
+
+		-- tiny gap between queued messages so last chunk doesn’t get instantly overwritten by next message
+		RunService.Heartbeat:Wait()
 	end
 end
 

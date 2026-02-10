@@ -122,8 +122,6 @@ local function posKey(cf)
 end
 
 function CFSocket.new(folder: Instance, pollRate: number?)
-	assert(folder and folder:IsA("Folder"), "CFSocket.new(folder): folder must be a Folder")
-
 	return setmetatable({
 		Folder = folder,
 		PollRate = pollRate or 1 / 30, -- seconds

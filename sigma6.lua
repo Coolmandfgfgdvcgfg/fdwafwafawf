@@ -1,15 +1,3 @@
--- CFSocket.lua
--- Chunked, polling-based "socket" over ONE CFrame-like property on Players.
--- Folder = game.Players
--- Local endpoint = game.Players.LocalPlayer
---
--- ✅ Uses getproperty/setproperty for reads/writes
--- ✅ Supports ALL characters (raw bytes)
--- ✅ Chunking + reassembly
--- ✅ Optional ACK confirm packets (best-effort)
--- ✅ PollRate = 0 => poll every Heartbeat
--- ✅ OUTGOING QUEUE so Send() calls never overlap (prevents spam overwrite)
--- ✅ Loopback so you receive your own sends instantly (no polling needed)
 
 local RunService = game:GetService("RunService")
 local Players = game:GetService("Players")
